@@ -1,0 +1,922 @@
+// prisma/schema.prisma
+// HobbyHub Community Platform — Complete Database Schema
+// Tech Stack: Next.js 14 + Prisma 5.22.0 + PostgreSQL + Better-Auth
+//
+// This is the canonical, ground-truth schema. It matches DATABASE_SCHEMA.md exactly.
+// No structural changes were needed to support phone-optional login or Telegram
+// widget login (AUTH_SPECIFICATION.md §3-4) — the existing users.phone_number /
+// phone_verified_at columns and the existing user_external_accounts table (which
+// already supports provider = 'telegram') cover both requirements. Those two features
+// are backend/application logic changes only.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum visibility_scope {
+  public
+  community
+  subcommunity
+}
+
+enum community_role {
+  member
+  moderator
+  admin
+}
+
+enum event_approval_status {
+  proposed
+  approved
+  rejected
+}
+
+enum hangout_join_type {
+  open
+  request_based
+}
+
+enum hangout_request_status {
+  pending
+  approved
+  rejected
+}
+
+enum report_status {
+  pending
+  reviewing
+  resolved
+  dismissed
+}
+
+enum moderation_action_type {
+  warn
+  suspend
+  ban
+  unban
+  content_removed
+  content_restored
+  promote_moderator
+  demote_moderator
+}
+
+enum notification_type {
+  post_reaction
+  comment_reply
+  event_approved
+  event_reminder
+  hangout_request
+  hangout_approved
+  report_resolved
+  moderation_action
+  follow
+  mention
+}
+
+enum subscription_status {
+  active
+  canceled
+  expired
+  trial
+}
+
+// =============================================================================
+// CORE / GEO / TAXONOMY
+// =============================================================================
+
+model locations {
+  id         String   @id @default(uuid()) @db.Uuid
+  place_name String   @db.VarChar(255)
+  latitude   Decimal  @db.Decimal(9, 6)
+  longitude  Decimal  @db.Decimal(9, 6)
+  place_id   String?  @db.VarChar(255)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  communities communities[]
+  events      events[]
+  hangouts    hangouts[]
+
+  @@unique([latitude, longitude], map: "uq_locations_coordinates")
+}
+
+model categories {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String   @unique @db.VarChar(50)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  communities communities[]
+}
+
+model tags {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String   @unique @db.VarChar(50)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  community_tags    community_tags[]
+  subcommunity_tags subcommunity_tags[]
+  post_tags         post_tags[]
+}
+
+// =============================================================================
+// IDENTITY / AUTH (Better-Auth-integrated)
+// =============================================================================
+
+model users {
+  id                     String    @id @default(uuid()) @db.Uuid
+  username               String    @unique @db.VarChar(30)
+  email                  String?   @unique @db.VarChar(255)
+  email_verified_at      DateTime? @db.Timestamptz(6)
+  email_verified         Boolean   @default(false)
+  phone_number           String?   @unique @db.VarChar(20)
+  phone_verified_at      DateTime? @db.Timestamptz(6) // gates phone login — see AUTH_SPECIFICATION.md §3
+  password_hash          String?   @db.Text // legacy column — UNUSED, see AUTH_SPECIFICATION.md §8
+  first_name             String    @db.VarChar(50)
+  last_name              String    @db.VarChar(50)
+  name                   String?   @db.VarChar(100) // Better-Auth generic display-name field
+  birth_date             DateTime  @db.Date
+  bio                    String?   @db.VarChar(500)
+  profile_picture_url    String?   @db.Text
+  trust_score            Int       @default(50)
+  trust_score_updated_at DateTime? @db.Timestamptz(6)
+  created_at             DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at             DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at              DateTime? @db.Timestamptz(6)
+
+  // Owned / Created
+  owned_communities      communities[]
+  created_subcommunities subcommunities[]
+  authored_posts         posts[]
+  authored_comments      comments[]
+  created_events         events[]
+  created_hangouts       hangouts[]
+  external_accounts      user_external_accounts[]
+  subscriptions          user_subscriptions[]
+  devices                user_devices[]
+
+  // Moderation (ambiguous relations — named)
+  moderation_actions_taken  moderation_actions[] @relation("ModeratorActions")
+  moderation_actions_target moderation_actions[] @relation("TargetUserActions")
+
+  // Reports (ambiguous relations — named)
+  reports_filed    reports[] @relation("Reporter")
+  reports_reviewed reports[] @relation("Reviewer")
+  reports_against  reports[] @relation("ReportedUser")
+
+  // Audit & Notifications
+  audit_logs     audit_logs[]
+  notifications  notifications[]
+  search_history search_history[]
+  messages       messages[]
+
+  // Social (ambiguous — named)
+  following       user_follows[] @relation("Following")
+  followers       user_follows[] @relation("Followers")
+  blocks_given    user_blocks[]  @relation("Blocker")
+  blocks_received user_blocks[]  @relation("Blocked")
+
+  // Memberships & Participation
+  community_memberships       community_members[] @relation("CommunityMemberUser")
+  community_members_appointed community_members[] @relation("CommunityMemberAppointedBy")
+  event_participants          event_participants[]
+  event_bans_received         event_bans[] @relation("EventBanUser")
+  event_bans_given            event_bans[] @relation("EventBanBanner")
+  hangout_participants        hangout_participants[]
+  hangout_join_requests       hangout_join_requests[]
+  hangout_bans_received       hangout_bans[] @relation("HangoutBanUser")
+  hangout_bans_given          hangout_bans[] @relation("HangoutBanBanner")
+  saved_posts                 saved_posts[]
+  saved_events                saved_events[]
+  saved_hangouts              saved_hangouts[]
+  conversation_members        conversation_members[]
+
+  // Reactions
+  post_reactions    post_reactions[]
+  comment_reactions comment_reactions[]
+
+  sessions sessions[]
+
+  // NOTE: age-13 constraint ("chk_users_age") is NOT expressed here — Prisma 5.22's
+  // schema DSL does not support raw-SQL @@check constraints (that lands in Prisma 6.4+).
+  // It is added via raw SQL in the migration instead — see MIGRATION_SQL_ADDENDUM.md.
+}
+
+model user_external_accounts {
+  id                String    @id @default(uuid()) @db.Uuid
+  user_id           String    @db.Uuid
+  provider          String    @db.VarChar(50) // 'credential' | 'google' | 'apple' | 'telegram' (v1); 'whatsapp' reserved for v1.2
+  provider_user_id  String    @db.VarChar(255)
+  provider_username String?   @db.VarChar(100)
+  provider_email    String?   @db.VarChar(255)
+  provider_phone    String?   @db.VarChar(50)
+  access_token      String?   @db.Text // encrypt at app level before storing
+  refresh_token     String?   @db.Text // encrypt at app level before storing
+  token_expires_at  DateTime? @db.Timestamptz(6)
+  raw_profile       Json      @default("{}")
+  is_active         Boolean   @default(true)
+  created_at        DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+
+  // Required by Better-Auth's account model
+  password                 String?   @db.Text // credential (password) provider hash lives here
+  id_token                 String?   @db.Text // Google/Apple/Telegram raw ID token / signed payload
+  scope                    String?   @db.Text // OAuth scopes granted
+  access_token_expires_at  DateTime? @db.Timestamptz(6)
+  refresh_token_expires_at DateTime? @db.Timestamptz(6)
+  issuer                   String?   @db.Text
+
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([provider, provider_user_id], map: "uq_external_account")
+  @@index([user_id], map: "idx_external_accounts_user")
+  @@index([provider, provider_user_id], map: "idx_external_accounts_provider_lookup")
+}
+
+model sessions {
+  id         String   @id @default(uuid()) @db.Uuid
+  token      String   @unique
+  user_id    String   @db.Uuid
+  expires_at DateTime @db.Timestamptz(6)
+  ip_address String?
+  user_agent String?
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model verification {
+  id         String   @id @default(uuid()) @db.Uuid
+  identifier String // e.g. "phone:+2519xxxxxxx" for phone OTP, or Better-Auth's own token identifiers
+  value      String
+  expires_at DateTime @db.Timestamptz(6)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  @@map("verification")
+}
+
+// =============================================================================
+// MONETIZATION (Future-ready)
+// =============================================================================
+
+model subscription_tiers {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @db.VarChar(50)
+  description String?  @db.Text
+  price       Decimal  @db.Decimal(10, 2)
+  currency    String   @default("USD") @db.VarChar(3)
+  features    Json     @default("{}")
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  user_subscriptions user_subscriptions[]
+}
+
+model user_subscriptions {
+  id         String              @id @default(uuid()) @db.Uuid
+  user_id    String              @db.Uuid
+  tier_id    String              @db.Uuid
+  status     subscription_status @default(active)
+  starts_at  DateTime            @db.Timestamptz(6)
+  ends_at    DateTime            @db.Timestamptz(6)
+  created_at DateTime            @default(now()) @db.Timestamptz(6)
+  updated_at DateTime            @default(now()) @updatedAt @db.Timestamptz(6)
+
+  user users              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  tier subscription_tiers @relation(fields: [tier_id], references: [id], onDelete: Restrict)
+
+  // "chk_user_subscriptions_dates" — added via raw SQL migration, see MIGRATION_SQL_ADDENDUM.md
+}
+
+model user_devices {
+  id           String   @id @default(uuid()) @db.Uuid
+  user_id      String   @db.Uuid
+  device_token String   @db.Text
+  platform     String   @db.VarChar(20)
+  created_at   DateTime @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id], map: "idx_devices_user")
+}
+
+// =============================================================================
+// SOCIAL
+// =============================================================================
+
+model user_follows {
+  follower_id  String   @db.Uuid
+  following_id String   @db.Uuid
+  followed_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  follower  users @relation("Following", fields: [follower_id], references: [id], onDelete: Cascade)
+  following users @relation("Followers", fields: [following_id], references: [id], onDelete: Cascade)
+
+  @@id([follower_id, following_id])
+  @@index([following_id], map: "idx_following")
+  // "chk_user_follows_not_self" — added via raw SQL migration, see MIGRATION_SQL_ADDENDUM.md
+}
+
+model user_blocks {
+  blocker_id String   @db.Uuid
+  blocked_id String   @db.Uuid
+  blocked_at DateTime @default(now()) @db.Timestamptz(6)
+
+  blocker users @relation("Blocker", fields: [blocker_id], references: [id], onDelete: Cascade)
+  blocked users @relation("Blocked", fields: [blocked_id], references: [id], onDelete: Cascade)
+
+  @@id([blocker_id, blocked_id])
+  @@index([blocked_id], map: "idx_userblocks_blocked")
+  // "chk_user_blocks_not_self" — added via raw SQL migration, see MIGRATION_SQL_ADDENDUM.md
+}
+
+// =============================================================================
+// COMMUNITIES
+// =============================================================================
+
+model communities {
+  id                  String    @id @default(uuid()) @db.Uuid
+  name                String    @db.VarChar(100)
+  slug                String    @unique @db.VarChar(120)
+  description         String?   @db.VarChar(1000)
+  rules               String?   @db.Text
+  creator_id          String    @db.Uuid
+  location_id         String?   @db.Uuid
+  category_id         String    @db.Uuid // immutable after creation — enforced in application layer, see AUTH_SPECIFICATION.md §9
+  banner_url          String?   @db.Text
+  profile_picture_url String?   @db.Text
+  is_private          Boolean   @default(false)
+  created_at          DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at          DateTime? @db.Timestamptz(6)
+
+  owner    users      @relation(fields: [creator_id], references: [id], onDelete: Restrict)
+  location locations? @relation(fields: [location_id], references: [id], onDelete: SetNull)
+  category categories @relation(fields: [category_id], references: [id], onDelete: Restrict)
+
+  members                    community_members[]
+  tags                       community_tags[]
+  subcommunities             subcommunities[]
+  posts                      posts[]
+  events                     events[]
+  hangouts                   hangouts[]
+  event_allowed_communities  event_allowed_communities[]
+  hangout_allowed_communities hangout_allowed_communities[]
+
+  @@index([creator_id], map: "idx_communities_creator")
+  @@index([category_id], map: "idx_communities_category")
+  @@index([location_id], map: "idx_communities_location")
+  @@index([deleted_at], map: "idx_communities_deleted")
+}
+
+model community_members {
+  community_id String         @db.Uuid
+  user_id      String         @db.Uuid
+  role         community_role @default(member)
+  joined_at    DateTime       @default(now()) @db.Timestamptz(6)
+  appointed_by String?        @db.Uuid
+  appointed_at DateTime?      @db.Timestamptz(6)
+
+  community   communities @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  user        users       @relation("CommunityMemberUser", fields: [user_id], references: [id], onDelete: Cascade)
+  appointedBy users?      @relation("CommunityMemberAppointedBy", fields: [appointed_by], references: [id], onDelete: SetNull)
+
+  @@id([community_id, user_id])
+  @@index([user_id], map: "idx_cm_user")
+}
+
+model community_tags {
+  community_id String @db.Uuid
+  tag_id       String @db.Uuid
+
+  community communities @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  tag       tags        @relation(fields: [tag_id], references: [id], onDelete: Cascade)
+
+  @@id([community_id, tag_id])
+  @@index([tag_id], map: "idx_ct_tag")
+}
+
+model subcommunities {
+  id           String    @id @default(uuid()) @db.Uuid
+  community_id String    @db.Uuid
+  creator_id   String    @db.Uuid
+  name         String    @db.VarChar(100)
+  description  String?   @db.VarChar(1000)
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at   DateTime? @db.Timestamptz(6)
+
+  community communities @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  creator   users       @relation(fields: [creator_id], references: [id], onDelete: Restrict)
+
+  tags                           subcommunity_tags[]
+  posts                          posts[]
+  events                         events[]
+  hangouts                       hangouts[]
+  event_allowed_subcommunities   event_allowed_subcommunities[]
+  hangout_allowed_subcommunities hangout_allowed_subcommunities[]
+
+  @@index([community_id], map: "idx_subcommunity_parent")
+  @@index([creator_id], map: "idx_subcommunity_creator")
+}
+
+model subcommunity_tags {
+  subcommunity_id String @db.Uuid
+  tag_id          String @db.Uuid
+
+  subcommunity subcommunities @relation(fields: [subcommunity_id], references: [id], onDelete: Cascade)
+  tag          tags           @relation(fields: [tag_id], references: [id], onDelete: Cascade)
+
+  @@id([subcommunity_id, tag_id])
+  @@index([tag_id], map: "idx_sct_tag")
+}
+
+// =============================================================================
+// POSTS & COMMENTS
+// =============================================================================
+
+model posts {
+  id              String    @id @default(uuid()) @db.Uuid
+  community_id    String    @db.Uuid
+  subcommunity_id String?   @db.Uuid
+  author_id       String    @db.Uuid
+  title           String?   @db.VarChar(150)
+  content         String?   @db.Text
+  media_url       String?   @db.Text
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at      DateTime? @db.Timestamptz(6)
+
+  community    communities     @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  subcommunity subcommunities? @relation(fields: [subcommunity_id], references: [id], onDelete: Cascade)
+  author       users           @relation(fields: [author_id], references: [id], onDelete: Cascade)
+
+  comments  comments[]
+  tags      post_tags[]
+  reactions post_reactions[]
+  saved_by  saved_posts[]
+  reports   reports[]
+
+  @@index([community_id], map: "idx_posts_community")
+  @@index([author_id], map: "idx_posts_author")
+  @@index([subcommunity_id], map: "idx_posts_subcommunity")
+  @@index([created_at], map: "idx_posts_created")
+  @@index([deleted_at], map: "idx_posts_deleted")
+  // "chk_posts_content" (at least one of title/content/media_url) — added via raw SQL
+  // migration, see MIGRATION_SQL_ADDENDUM.md
+}
+
+model post_tags {
+  post_id String @db.Uuid
+  tag_id  String @db.Uuid
+
+  post posts @relation(fields: [post_id], references: [id], onDelete: Cascade)
+  tag  tags  @relation(fields: [tag_id], references: [id], onDelete: Cascade)
+
+  @@id([post_id, tag_id])
+  @@index([tag_id], map: "idx_posttags_tag")
+}
+
+model comments {
+  id                String    @id @default(uuid()) @db.Uuid
+  post_id           String    @db.Uuid
+  author_id         String    @db.Uuid
+  parent_comment_id String?   @db.Uuid
+  content           String    @db.VarChar(1000)
+  created_at        DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at        DateTime? @db.Timestamptz(6)
+
+  post    posts      @relation(fields: [post_id], references: [id], onDelete: Cascade)
+  author  users      @relation(fields: [author_id], references: [id], onDelete: Cascade)
+  parent  comments?  @relation("CommentReplies", fields: [parent_comment_id], references: [id], onDelete: Cascade)
+  replies comments[] @relation("CommentReplies")
+
+  reactions comment_reactions[]
+  reports   reports[]
+
+  @@index([post_id], map: "idx_comments_post")
+  @@index([author_id], map: "idx_comments_author")
+  @@index([parent_comment_id], map: "idx_comments_parent")
+  @@index([deleted_at], map: "idx_comments_deleted")
+}
+
+model post_reactions {
+  post_id    String   @db.Uuid
+  user_id    String   @db.Uuid
+  reacted_at DateTime @default(now()) @db.Timestamptz(6)
+
+  post posts @relation(fields: [post_id], references: [id], onDelete: Cascade)
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([post_id, user_id])
+  @@index([user_id], map: "idx_postreaction_user")
+}
+
+model comment_reactions {
+  comment_id String   @db.Uuid
+  user_id    String   @db.Uuid
+  reacted_at DateTime @default(now()) @db.Timestamptz(6)
+
+  comment comments @relation(fields: [comment_id], references: [id], onDelete: Cascade)
+  user    users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([comment_id, user_id])
+  @@index([user_id], map: "idx_commentreaction_user")
+}
+
+model saved_posts {
+  user_id  String   @db.Uuid
+  post_id  String   @db.Uuid
+  saved_at DateTime @default(now()) @db.Timestamptz(6)
+
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  post posts @relation(fields: [post_id], references: [id], onDelete: Cascade)
+
+  @@id([user_id, post_id])
+  @@index([post_id], map: "idx_saved_posts_post")
+}
+
+// =============================================================================
+// EVENTS
+// =============================================================================
+
+model events {
+  id                String                @id @default(uuid()) @db.Uuid
+  creator_id        String                @db.Uuid
+  community_id      String                @db.Uuid
+  subcommunity_id   String?               @db.Uuid
+  location_id       String?               @db.Uuid
+  title             String                @db.VarChar(150)
+  description       String?               @db.VarChar(3000)
+  cover_image_url   String?               @db.Text
+  starts_at         DateTime              @db.Timestamptz(6)
+  ends_at           DateTime?             @db.Timestamptz(6)
+  visibility        visibility_scope      @default(public)
+  approval_status   event_approval_status @default(approved)
+  is_verified       Boolean               @default(false)
+  max_participants  Int?
+  price             Decimal?              @db.Decimal(10, 2) // future — ignored by v1 backend
+  currency          String?               @db.VarChar(3) // future
+  external_event_id String?               @db.VarChar(255) // future
+  external_provider String?               @db.VarChar(50) // future
+  rsvp_required     Boolean               @default(false)
+  created_at        DateTime              @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime              @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at        DateTime?             @db.Timestamptz(6)
+
+  creator      users           @relation(fields: [creator_id], references: [id], onDelete: Restrict)
+  community    communities     @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  subcommunity subcommunities? @relation(fields: [subcommunity_id], references: [id], onDelete: Cascade)
+  location     locations?      @relation(fields: [location_id], references: [id], onDelete: SetNull)
+
+  allowed_communities    event_allowed_communities[]
+  allowed_subcommunities event_allowed_subcommunities[]
+  participants           event_participants[]
+  bans                   event_bans[]
+  saved_by               saved_events[]
+  reports                reports[]
+
+  @@index([creator_id], map: "idx_events_creator")
+  @@index([community_id], map: "idx_events_community")
+  @@index([subcommunity_id], map: "idx_events_subcommunity")
+  @@index([starts_at], map: "idx_events_start")
+  @@index([deleted_at], map: "idx_events_deleted")
+  @@index([approval_status], map: "idx_events_approval")
+  // "chk_events_dates" and "chk_events_price" — added via raw SQL migration, see
+  // MIGRATION_SQL_ADDENDUM.md
+}
+
+model event_allowed_communities {
+  event_id     String @db.Uuid
+  community_id String @db.Uuid
+
+  event     events      @relation(fields: [event_id], references: [id], onDelete: Cascade)
+  community communities @relation(fields: [community_id], references: [id], onDelete: Cascade)
+
+  @@id([event_id, community_id])
+}
+
+model event_allowed_subcommunities {
+  event_id        String @db.Uuid
+  subcommunity_id String @db.Uuid
+
+  event        events         @relation(fields: [event_id], references: [id], onDelete: Cascade)
+  subcommunity subcommunities @relation(fields: [subcommunity_id], references: [id], onDelete: Cascade)
+
+  @@id([event_id, subcommunity_id])
+}
+
+model event_participants {
+  event_id  String   @db.Uuid
+  user_id   String   @db.Uuid
+  joined_at DateTime @default(now()) @db.Timestamptz(6)
+
+  event events @relation(fields: [event_id], references: [id], onDelete: Cascade)
+  user  users  @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([event_id, user_id])
+  @@index([user_id], map: "idx_event_participants_user")
+}
+
+model event_bans {
+  event_id  String   @db.Uuid
+  user_id   String   @db.Uuid
+  banned_by String   @db.Uuid
+  reason    String?  @db.VarChar(500)
+  banned_at DateTime @default(now()) @db.Timestamptz(6)
+
+  event  events @relation(fields: [event_id], references: [id], onDelete: Cascade)
+  user   users  @relation("EventBanUser", fields: [user_id], references: [id], onDelete: Cascade)
+  banner users  @relation("EventBanBanner", fields: [banned_by], references: [id], onDelete: Restrict)
+
+  @@id([event_id, user_id])
+  @@index([user_id], map: "idx_eventban_user")
+}
+
+model saved_events {
+  user_id  String   @db.Uuid
+  event_id String   @db.Uuid
+  saved_at DateTime @default(now()) @db.Timestamptz(6)
+
+  user  users  @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  event events @relation(fields: [event_id], references: [id], onDelete: Cascade)
+
+  @@id([user_id, event_id])
+  @@index([event_id], map: "idx_saved_events_event")
+}
+
+// =============================================================================
+// HANGOUTS
+// =============================================================================
+
+model hangouts {
+  id               String            @id @default(uuid()) @db.Uuid
+  creator_id       String            @db.Uuid
+  community_id     String?           @db.Uuid // nullable = standalone hangout
+  subcommunity_id  String?           @db.Uuid
+  location_id      String?           @db.Uuid
+  title            String            @db.VarChar(150)
+  description      String?           @db.VarChar(3000)
+  cover_image_url  String?           @db.Text
+  starts_at        DateTime          @db.Timestamptz(6)
+  ends_at          DateTime?         @db.Timestamptz(6)
+  visibility       visibility_scope  @default(public)
+  join_type        hangout_join_type @default(open)
+  max_participants Int?
+  created_at       DateTime          @default(now()) @db.Timestamptz(6)
+  updated_at       DateTime          @default(now()) @updatedAt @db.Timestamptz(6)
+  deleted_at       DateTime?         @db.Timestamptz(6)
+
+  creator      users           @relation(fields: [creator_id], references: [id], onDelete: Restrict)
+  community    communities?    @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  subcommunity subcommunities? @relation(fields: [subcommunity_id], references: [id], onDelete: Cascade)
+  location     locations?      @relation(fields: [location_id], references: [id], onDelete: SetNull)
+
+  allowed_communities    hangout_allowed_communities[]
+  allowed_subcommunities hangout_allowed_subcommunities[]
+  participants           hangout_participants[]
+  join_requests           hangout_join_requests[]
+  bans                    hangout_bans[]
+  saved_by                saved_hangouts[]
+  reports                 reports[]
+
+  @@index([creator_id], map: "idx_hangouts_creator")
+  @@index([community_id], map: "idx_hangouts_community")
+  @@index([starts_at], map: "idx_hangouts_start")
+  @@index([deleted_at], map: "idx_hangouts_deleted")
+  // "chk_hangouts_dates" — added via raw SQL migration, see MIGRATION_SQL_ADDENDUM.md
+}
+
+model hangout_allowed_communities {
+  hangout_id   String @db.Uuid
+  community_id String @db.Uuid
+
+  hangout   hangouts    @relation(fields: [hangout_id], references: [id], onDelete: Cascade)
+  community communities @relation(fields: [community_id], references: [id], onDelete: Cascade)
+
+  @@id([hangout_id, community_id])
+}
+
+model hangout_allowed_subcommunities {
+  hangout_id      String @db.Uuid
+  subcommunity_id String @db.Uuid
+
+  hangout      hangouts       @relation(fields: [hangout_id], references: [id], onDelete: Cascade)
+  subcommunity subcommunities @relation(fields: [subcommunity_id], references: [id], onDelete: Cascade)
+
+  @@id([hangout_id, subcommunity_id])
+}
+
+model hangout_participants {
+  hangout_id String   @db.Uuid
+  user_id    String   @db.Uuid
+  joined_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  hangout hangouts @relation(fields: [hangout_id], references: [id], onDelete: Cascade)
+  user    users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([hangout_id, user_id])
+  @@index([user_id], map: "idx_hangout_participants_user")
+}
+
+model hangout_join_requests {
+  hangout_id   String                  @db.Uuid
+  user_id      String                  @db.Uuid
+  status       hangout_request_status  @default(pending)
+  created_at   DateTime                @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime                @default(now()) @updatedAt @db.Timestamptz(6)
+  responded_at DateTime?               @db.Timestamptz(6)
+
+  hangout hangouts @relation(fields: [hangout_id], references: [id], onDelete: Cascade)
+  user    users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([hangout_id, user_id])
+}
+
+model hangout_bans {
+  hangout_id String   @db.Uuid
+  user_id    String   @db.Uuid
+  banned_by  String   @db.Uuid
+  reason     String?  @db.VarChar(500)
+  banned_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  hangout hangouts @relation(fields: [hangout_id], references: [id], onDelete: Cascade)
+  user    users    @relation("HangoutBanUser", fields: [user_id], references: [id], onDelete: Cascade)
+  banner  users    @relation("HangoutBanBanner", fields: [banned_by], references: [id], onDelete: Restrict)
+
+  @@id([hangout_id, user_id])
+  @@index([user_id], map: "idx_hangoutban_user")
+}
+
+model saved_hangouts {
+  user_id    String   @db.Uuid
+  hangout_id String   @db.Uuid
+  saved_at   DateTime @default(now()) @db.Timestamptz(6)
+
+  user    users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  hangout hangouts @relation(fields: [hangout_id], references: [id], onDelete: Cascade)
+
+  @@id([user_id, hangout_id])
+  @@index([hangout_id], map: "idx_saved_hangouts_hangout")
+}
+
+// =============================================================================
+// MODERATION & REPORTING
+// =============================================================================
+
+model reports {
+  id                  String        @id @default(uuid()) @db.Uuid
+  reporter_id         String        @db.Uuid
+  reported_user_id    String?       @db.Uuid
+  reported_post_id    String?       @db.Uuid
+  reported_comment_id String?       @db.Uuid
+  reported_event_id   String?       @db.Uuid
+  reported_hangout_id String?       @db.Uuid
+  reason              String        @db.VarChar(500)
+  status              report_status @default(pending)
+  reviewed_by         String?       @db.Uuid
+  reviewed_at         DateTime?     @db.Timestamptz(6)
+  created_at          DateTime      @default(now()) @db.Timestamptz(6)
+
+  reporter     users     @relation("Reporter", fields: [reporter_id], references: [id], onDelete: Cascade)
+  reportedUser users?    @relation("ReportedUser", fields: [reported_user_id], references: [id], onDelete: SetNull)
+  post         posts?    @relation(fields: [reported_post_id], references: [id], onDelete: SetNull)
+  comment      comments? @relation(fields: [reported_comment_id], references: [id], onDelete: SetNull)
+  event        events?   @relation(fields: [reported_event_id], references: [id], onDelete: SetNull)
+  hangout      hangouts? @relation(fields: [reported_hangout_id], references: [id], onDelete: SetNull)
+  reviewer     users?    @relation("Reviewer", fields: [reviewed_by], references: [id], onDelete: SetNull)
+
+  moderation_actions moderation_actions[]
+
+  @@index([reporter_id], map: "idx_reports_reporter")
+  @@index([status], map: "idx_reports_status")
+  @@index([created_at], map: "idx_reports_created")
+  // "chk_reports_target" (exactly one target column set) — added via raw SQL migration,
+  // see MIGRATION_SQL_ADDENDUM.md
+}
+
+model moderation_actions {
+  id             String                  @id @default(uuid()) @db.Uuid
+  moderator_id   String                  @db.Uuid
+  target_user_id String?                 @db.Uuid
+  report_id      String?                 @db.Uuid
+  action_type    moderation_action_type
+  notes          String?                 @db.VarChar(500)
+  created_at     DateTime                @default(now()) @db.Timestamptz(6)
+
+  moderator  users    @relation("ModeratorActions", fields: [moderator_id], references: [id], onDelete: Restrict)
+  targetUser users?   @relation("TargetUserActions", fields: [target_user_id], references: [id], onDelete: SetNull)
+  report     reports? @relation(fields: [report_id], references: [id], onDelete: SetNull)
+
+  @@index([moderator_id], map: "idx_modactions_moderator")
+  @@index([report_id], map: "idx_modactions_report")
+}
+
+// =============================================================================
+// AUDIT & NOTIFICATIONS
+// =============================================================================
+
+model audit_logs {
+  id          String   @id @default(uuid()) @db.Uuid
+  actor_id    String?  @db.Uuid
+  action      String   @db.VarChar(100)
+  entity_type String   @db.VarChar(50)
+  entity_id   String?  @db.Uuid
+  description String?  @db.Text
+  ip_address  String?  @db.Inet
+  user_agent  String?  @db.Text
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  actor users? @relation(fields: [actor_id], references: [id], onDelete: SetNull)
+
+  @@index([actor_id], map: "idx_audit_actor")
+  @@index([entity_type, entity_id], map: "idx_audit_entity")
+}
+
+model notifications {
+  id                  String            @id @default(uuid()) @db.Uuid
+  user_id             String            @db.Uuid
+  type                notification_type
+  title               String            @db.VarChar(120)
+  message             String            @db.VarChar(500)
+  related_entity_type String?           @db.VarChar(50)
+  related_entity_id   String?           @db.Uuid
+  is_read             Boolean           @default(false)
+  created_at          DateTime          @default(now()) @db.Timestamptz(6)
+
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id], map: "idx_notifications_user")
+  @@index([created_at], map: "idx_notifications_created")
+}
+
+model search_history {
+  id          String   @id @default(uuid()) @db.Uuid
+  user_id     String   @db.Uuid
+  search_text String   @db.VarChar(150)
+  searched_at DateTime @default(now()) @db.Timestamptz(6)
+
+  user users @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id], map: "idx_search_user")
+  @@index([searched_at], map: "idx_search_time")
+}
+
+// =============================================================================
+// MESSAGING (Future-ready, schema only — no v1 UI)
+// =============================================================================
+
+model conversations {
+  id         String   @id @default(uuid()) @db.Uuid
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  members  conversation_members[]
+  messages messages[]
+}
+
+model conversation_members {
+  conversation_id String   @db.Uuid
+  user_id         String   @db.Uuid
+  joined_at       DateTime @default(now()) @db.Timestamptz(6)
+
+  conversation conversations @relation(fields: [conversation_id], references: [id], onDelete: Cascade)
+  user         users         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([conversation_id, user_id])
+  @@index([user_id], map: "idx_convmember_user")
+}
+
+model messages {
+  id              String    @id @default(uuid()) @db.Uuid
+  conversation_id String    @db.Uuid
+  sender_id       String    @db.Uuid
+  message_text    String?   @db.Text
+  media_url       String?   @db.Text
+  sent_at         DateTime  @default(now()) @db.Timestamptz(6)
+  edited_at       DateTime? @db.Timestamptz(6)
+  deleted_at      DateTime? @db.Timestamptz(6)
+
+  conversation conversations @relation(fields: [conversation_id], references: [id], onDelete: Cascade)
+  sender       users         @relation(fields: [sender_id], references: [id], onDelete: Cascade)
+
+  @@index([conversation_id], map: "idx_messages_conversation")
+  @@index([sender_id], map: "idx_messages_sender")
+  @@index([sent_at], map: "idx_messages_sent")
+  // "chk_messages_content" (at least one of message_text/media_url) — added via raw SQL
+  // migration, see MIGRATION_SQL_ADDENDUM.md
+}
